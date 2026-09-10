@@ -1,0 +1,10 @@
+__pycache__/
+*.egg-info/
+.venv/
+.pytest_cache/
+.cpcache/
+.nrepl-port
+target/
+.idea/
+*.iml
+.DS_Store

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "synergyxm-stomp"
+version = "0.1.0"
+description = "STOMP 1.2 over WebSocket client for SynergyXM workers (RabbitMQ Web STOMP)"
+requires-python = ">=3.11"
+dependencies = ["websocket-client>=1.8"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["synergyxm_stomp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
