@@ -47,9 +47,23 @@
           (str/replace "\n" "\\n") (str/replace ":" "\\c"))))
 
 (defn- unescape [^String s raw?]
+  ;; one left-to-right pass: sequential str/replace would rewrite the output
+  ;; of an earlier replacement (an escaped backslash followed by n, r or c).
   (if (or raw? (not (str/includes? s "\\"))) s
-      (-> s (str/replace "\\r" "\r") (str/replace "\\n" "\n")
-          (str/replace "\\c" ":") (str/replace "\\\\" "\\"))))
+      (let [n  (count s)
+            sb (StringBuilder. n)]
+        (loop [i 0]
+          (if (>= i n)
+            (str sb)
+            (let [c (.charAt s i)]
+              (if (and (= \\ c) (< (inc i) n))
+                (case (.charAt s (inc i))
+                  \r (do (.append sb \return) (recur (+ i 2)))
+                  \n (do (.append sb \newline) (recur (+ i 2)))
+                  \c (do (.append sb \:) (recur (+ i 2)))
+                  \\ (do (.append sb \\) (recur (+ i 2)))
+                  (do (.append sb c) (recur (inc i))))   ; unknown escape: as-is
+                (do (.append sb c) (recur (inc i))))))))))
 
 (defn encode-frame
   "Serialise a frame to a String (the WebSocket text payload). Adds
@@ -63,8 +77,10 @@
          headers (cond-> (into {} (remove (comp nil? val)) headers)
                    (pos? blen) (assoc "content-length" (str blen)))]
      (str command "\n"
-          (str/join "\n" (map (fn [[k v]] (str (escape (name k) raw?) ":" (escape (str v) raw?))) headers))
-          "\n\n" body "\u0000"))))
+          (when (seq headers)
+            (str (str/join "\n" (map (fn [[k v]] (str (escape (name k) raw?) ":" (escape (str v) raw?))) headers))
+                 "\n"))
+          "\n" body "\u0000"))))
 
 (defn decode-frame
   "Parse one complete frame (a text payload without the trailing NUL, or
@@ -73,9 +89,16 @@
   (let [s (str/replace s #"^[\r\n]+" "")
         s (if (str/ends-with? s "\u0000") (subs s 0 (dec (count s))) s)]
     (when-not (str/blank? s)
-      (let [sep      (or (str/index-of s "\n\n") (count s))
-            head     (str/replace (subs s 0 sep) "\r\n" "\n")
-            body     (if (< (+ sep 2) (count s)) (subs s (+ sep 2)) "")
+      (let [lf       (str/index-of s "\n\n")
+            crlf     (str/index-of s "\n\r\n")
+            [sep skip] (cond (and lf crlf) (if (< crlf lf) [crlf 3] [lf 2])
+                             crlf [crlf 3]
+                             lf   [lf 2]
+                             :else [(count s) 2])
+            head     (-> (subs s 0 sep)
+                         (str/replace "\r\n" "\n")
+                         (str/replace #"\r$" ""))   ; CRLF: the last header's own CR
+            body     (if (< (+ sep skip) (count s)) (subs s (+ sep skip)) "")
             [command & lines] (str/split-lines head)
             command  (str/trim command)
             raw?     (contains? #{"CONNECT" "CONNECTED"} command)

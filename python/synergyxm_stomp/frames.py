@@ -90,10 +90,14 @@ class Decoder:
                 self._buf = self._buf[1:]
             if not self._buf:
                 break
-            sep = self._buf.find(b"\n\n")
-            if sep < 0:
+            # end of headers: a blank line, LF- or CRLF-terminated
+            lf, crlf = self._buf.find(b"\n\n"), self._buf.find(b"\n\r\n")
+            if lf < 0 and crlf < 0:
                 break
+            sep, sep_len = (crlf, 3) if lf < 0 or (0 <= crlf < lf) else (lf, 2)
             head = self._buf[:sep].decode("utf-8", errors="replace").replace("\r\n", "\n")
+            if head.endswith("\r"):  # CRLF: the last header line's own CR
+                head = head[:-1]
             lines = head.split("\n")
             command = lines[0].strip()
             raw = command in ("CONNECT", "CONNECTED")
@@ -105,7 +109,7 @@ class Decoder:
                 k = _unescape(k, raw)
                 if k not in headers:  # first occurrence wins (spec)
                     headers[k] = _unescape(v, raw)
-            body_start = sep + 2
+            body_start = sep + sep_len
             if "content-length" in headers:
                 try:
                     n = int(headers["content-length"])
