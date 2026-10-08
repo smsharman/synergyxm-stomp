@@ -13,6 +13,14 @@
                 (catch Exception e (nack!)))))
        (stomp/publish! conn \"job-events\" rk body {:user-id node-uuid}))
 
+   Heart-beats (doc/WORKER.md, *Heart-beats*): CONNECT asks for
+   `:heartbeat-ms` both ways (10 s) and CONNECTED answers with the broker's;
+   the connection then sends a newline every max(ours, broker's) ms and
+   expects a byte from the broker at least every max(broker's, ours) ms. A
+   connection silent for twice that is dead - a proxy such as Cloudflare has
+   dropped it without a close - and is reported through :on-closed exactly as
+   a closed socket is, so the worker loop reconnects.
+
    Token refresh is a reconnect (STOMP has no update-secret): `reconnect!`
    closes, connects with the new token and re-subscribes every active
    subscription. `run-with-refresh!` wraps that in the loop the three
@@ -140,11 +148,54 @@
 ;; Connection
 ;; =============================================================================
 
+(declare connected?)
+
 (defn- send-text! [conn ^String text]
   (let [^WebSocket ws (:ws @(:state conn))]
     (when (nil? ws) (throw (ex-info "not connected" {:type :not-connected})))
     (locking (:lock conn)
-      (.get ^CompletableFuture (.sendText ws text true) 30 TimeUnit/SECONDS))))
+      (.get ^CompletableFuture (.sendText ws text true) 30 TimeUnit/SECONDS)
+      (reset! (:last-tx conn) (System/currentTimeMillis)))))
+
+(defn- heard! [conn] (reset! (:last-rx conn) (System/currentTimeMillis)))
+
+(defn negotiate-heartbeat
+  "The heart-beat the two sides settle on (STOMP 1.2 §Heart-beating): from
+   what we asked, `cx,cy`, and what CONNECTED answered, `sx,sy` (both
+   strings; absent means 0,0). Returns {:send-ms n :expect-ms n}, 0 meaning
+   none in that direction."
+  [asked answered]
+  (let [[cx cy] (map #(Long/parseLong (str/trim %)) (str/split (str asked) #","))
+        [sx sy] (if (str/blank? answered) [0 0] (map #(Long/parseLong (str/trim %)) (str/split answered #",")))]
+    {:send-ms   (if (and (pos? cx) (pos? sy)) (max cx sy) 0)
+     :expect-ms (if (and (pos? cy) (pos? sx)) (max cy sx) 0)}))
+
+(defn- dead!
+  "The broker has gone quiet past the heart-beat tolerance: abandon the
+   socket and report the drop as a close would, once."
+  [conn reason]
+  (let [{:keys [^WebSocket ws closing? on-closed]} @(:state conn)]
+    (when (and ws (not closing?))
+      (log/warn "STOMP connection dead:" reason)
+      ;; the socket is forgotten first, so its own late onClose/onError is
+      ;; not that of the current socket and reports nothing
+      (swap! (:state conn) assoc :ws nil :connected? false)
+      (try (.abort ws) (catch Throwable _ nil))
+      (when on-closed (on-closed reason)))))
+
+(defn- heartbeat-tick!
+  "Runs every `tick-ms` while connected: sends a heart-beat when one is
+   due, and declares the connection dead after twice the expected interval
+   (plus a second's grace) without a byte from the broker."
+  [conn {:keys [send-ms expect-ms]}]
+  (try
+    (when (connected? conn)
+      (let [now (System/currentTimeMillis)]
+        (when (and (pos? send-ms) (>= (- now @(:last-tx conn)) send-ms))
+          (send-text! conn "\n"))
+        (when (and (pos? expect-ms) (> (- now @(:last-rx conn)) (+ (* 2 expect-ms) 1000)))
+          (dead! conn (str "no heart-beat from the broker for " (- now @(:last-rx conn)) " ms")))))
+    (catch Throwable t (log/debug t "heart-beat tick failed"))))
 
 (defn- dispatch! [conn frame]
   (let [{:keys [command headers body]} frame
@@ -171,8 +222,9 @@
 (defn- listener [conn]
   (let [buf (StringBuilder.)]
     (reify WebSocket$Listener
-      (onOpen [_ ws] (.request ws 1))
+      (onOpen [_ ws] (heard! conn) (.request ws 1))
       (onText [_ ws data last?]
+        (heard! conn)
         (.append buf ^CharSequence data)
         (when last?
           (let [text (str buf)]
@@ -192,8 +244,8 @@
               bytes (byte-array (.remaining data))]
           (.get data bytes)
           (.onText ^WebSocket$Listener this ws (String. bytes StandardCharsets/UTF_8) last?)))
-      (onPing [_ ws msg] (.sendPong ws msg) (.request ws 1) nil)
-      (onPong [_ ws _] (.request ws 1) nil)
+      (onPing [_ ws msg] (heard! conn) (.sendPong ws msg) (.request ws 1) nil)
+      (onPong [_ ws _] (heard! conn) (.request ws 1) nil)
       (onClose [_ ws code reason]
         ;; Only the *current* socket may report a drop: a superseded socket
         ;; (after reconnect!) closes late and must not trigger another one.
@@ -212,6 +264,11 @@
         nil))))
 
 (defn connected? [conn] (boolean (:connected? @(:state conn))))
+
+(defn heartbeat
+  "The heart-beat in force, {:send-ms :expect-ms}, or nil before CONNECTED."
+  [conn]
+  (:heartbeat @(:state conn)))
 
 (defn- open-socket! [conn]
   (let [{:keys [url vhost token heartbeat-ms connect-timeout]} @(:state conn)
@@ -234,15 +291,19 @@
       (when (= "ERROR" (:command frame))
         (throw (ex-info (str "STOMP error: " (get-in frame [:headers "message"]) " " (:body frame))
                         {:type :stomp-error :frame frame})))
+      (heard! conn)
       (swap! (:state conn) assoc :connected? true)
-      ;; heart-beats: one newline every heartbeat-ms
-      (let [^ScheduledExecutorService exec (:exec @(:state conn))]
-        (swap! (:state conn) assoc :hb-task
-               (.scheduleAtFixedRate exec
-                                     (fn [] (try (when (connected? conn) (send-text! conn "\n"))
-                                                 (catch Throwable _ nil)))
-                                     heartbeat-ms heartbeat-ms TimeUnit/MILLISECONDS)))
-      (log/info "STOMP connected to" url "(vhost" vhost ")")
+      ;; heart-beats, as negotiated with the broker
+      (let [^ScheduledExecutorService exec (:exec @(:state conn))
+            {:keys [send-ms expect-ms] :as hb} (negotiate-heartbeat (str heartbeat-ms "," heartbeat-ms)
+                                                                    (get-in frame [:headers "heart-beat"]))
+            tick-ms (->> [send-ms (quot expect-ms 2)] (filter pos?) (reduce min Long/MAX_VALUE) (max 250))]
+        (swap! (:state conn) assoc :heartbeat hb)
+        (when (or (pos? send-ms) (pos? expect-ms))
+          (swap! (:state conn) assoc :hb-task
+                 (.scheduleAtFixedRate exec (fn [] (heartbeat-tick! conn hb))
+                                       tick-ms tick-ms TimeUnit/MILLISECONDS))))
+      (log/info "STOMP connected to" url "(vhost" vhost ")" "heart-beat" (:heartbeat @(:state conn)))
       conn)))
 
 (defn- resubscribe-all! [conn]
@@ -254,7 +315,8 @@
 
 (defn connect
   "Open a connection. opts: :url (ws:// or wss://), :vhost, :token,
-   optional :heartbeat-ms (10000), :connect-timeout seconds (20),
+   optional :heartbeat-ms (10000; what CONNECT asks for both ways - the
+   broker may answer with more), :connect-timeout seconds (20),
    :on-closed (fn [reason]) called once when the socket drops unexpectedly,
    :on-error (fn [message]) for ERROR frames."
   [{:keys [url vhost token heartbeat-ms connect-timeout on-closed on-error]}]
@@ -264,6 +326,7 @@
                             :on-closed on-closed :on-error on-error
                             :subs {} :sub-seq 0 :connected? false :closing? false
                             :exec (Executors/newSingleThreadScheduledExecutor)})
+              :last-rx (atom 0) :last-tx (atom 0)
               :lock (Object.)}]
     (open-socket! conn)))
 

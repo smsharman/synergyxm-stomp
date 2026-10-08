@@ -146,9 +146,11 @@
                         (when-let [frame (stomp/decode-frame part)]
                           (swap! frames conj frame)
                           (when (= "CONNECT" (:command frame))
+                            ;; answers the heart-beat the client asked for, as
+                            ;; RabbitMQ does; a test may ask for none ("0,0")
                             (.send ^WebSocket conn
                                    (stomp/encode-frame "CONNECTED" {"version" "1.2"
-                                                                    "heart-beat" "10000,10000"}))))))))]
+                                                                    "heart-beat" (get-in frame [:headers "heart-beat"] "0,0")}))))))))]
     (.setReuseAddr ^WebSocketServer server true)
     (.start ^WebSocketServer server)
     (assert (deref started 10000 false) "test WebSocket server did not start")
@@ -403,6 +405,46 @@
         (Thread/sleep 300)
         (is (empty? (remove #(= "CONNECT" (:command %)) @(:frames srv))))
         (is (stomp/connected? conn))
+        (finally (stomp/shutdown! conn))))))
+
+(deftest heartbeat-negotiation
+  (is (= {:send-ms 10000 :expect-ms 10000} (stomp/negotiate-heartbeat "10000,10000" "10000,10000")))
+  (is (= {:send-ms 30000 :expect-ms 10000} (stomp/negotiate-heartbeat "10000,10000" "5000,30000"))
+      "we send at the slower of the two, and expect at the slower of the two")
+  (is (= {:send-ms 0 :expect-ms 0} (stomp/negotiate-heartbeat "10000,10000" "0,0")) "the broker declines")
+  (is (= {:send-ms 0 :expect-ms 0} (stomp/negotiate-heartbeat "10000,10000" nil)) "no answer: none")
+  (is (= {:send-ms 0 :expect-ms 10000} (stomp/negotiate-heartbeat "0,10000" "10000,0"))))
+
+(deftest a-silent-broker-is-a-dropped-connection
+  ;; The server echoes the client's heart-beat but never sends one, so after
+  ;; twice the interval plus a second the client gives the socket up and
+  ;; reports it through :on-closed, exactly as a close would - which is what
+  ;; a proxy dropping the connection without a close looks like.
+  (with-server [srv]
+    (let [reasons (atom [])
+          conn    (connect! srv {:heartbeat-ms 300 :on-closed #(swap! reasons conj %)})]
+      (try
+        (is (= {:send-ms 300 :expect-ms 300} (stomp/heartbeat conn)))
+        (is (wait-for #(seq @reasons) 5000) "on-closed within the tolerance")
+        (is (str/starts-with? (first @reasons) "no heart-beat from the broker"))
+        (is (not (stomp/connected? conn)))
+        (Thread/sleep 300)
+        (is (= 1 (count @reasons)) "reported once, not again by the socket's own close")
+        (testing "a reconnect starts afresh"
+          (stomp/reconnect! conn)
+          (is (stomp/connected? conn)))
+        (finally (stomp/shutdown! conn))))))
+
+(deftest a-broker-that-declines-heart-beats-is-left-alone
+  (with-server [srv]
+    (let [reasons (atom [])
+          conn    (connect! srv {:heartbeat-ms 0 :on-closed #(swap! reasons conj %)})]
+      (try
+        (is (= {:send-ms 0 :expect-ms 0} (stomp/heartbeat conn)))
+        (Thread/sleep 1500)
+        (is (empty? @reasons))
+        (is (stomp/connected? conn))
+        (is (empty? (filter #(= "\n" %) (map str @(:frames srv)))) "nothing sent")
         (finally (stomp/shutdown! conn))))))
 
 (deftest run-with-refresh-reconnects-with-a-refreshed-token

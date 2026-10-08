@@ -8,7 +8,7 @@ from collections import deque
 import pytest
 import websocket
 
-from synergyxm_stomp import Broker, ConnectionLost, StompError, ws_url
+from synergyxm_stomp import Broker, ConnectionLost, StompError, negotiate_heartbeat, ws_url
 from synergyxm_stomp import broker as broker_mod
 from synergyxm_stomp.frames import Decoder, encode
 
@@ -352,7 +352,67 @@ def test_close_during_consume_ends_the_generator(broker, sockets):
 # -- heart-beats ------------------------------------------------------------------
 
 
-def test_heartbeat_thread_sends_a_newline(sockets):
+def echoing_sockets(monkeypatch, answer):
+    """FakeWS factory whose CONNECTED carries ``answer`` as its heart-beat."""
+    created: list[FakeWS] = []
+
+    def create_connection(url, **opts):
+        ws = FakeWS(url, **opts)
+        ws.push(encode("CONNECTED", {"version": "1.2", "heart-beat": answer}))
+        created.append(ws)
+        return ws
+
+    monkeypatch.setattr(broker_mod.websocket, "create_connection", create_connection)
+    return created
+
+
+def test_negotiate_heartbeat():
+    assert negotiate_heartbeat("10000,10000", "10000,10000") == (10.0, 10.0)
+    assert negotiate_heartbeat("10000,10000", "5000,30000") == (30.0, 10.0)
+    assert negotiate_heartbeat("10000,10000", "0,0") == (0.0, 0.0)
+    assert negotiate_heartbeat("10000,10000", None) == (0.0, 0.0)
+    assert negotiate_heartbeat("0,10000", "10000,0") == (0.0, 10.0)
+
+
+def test_the_negotiated_heartbeat_is_what_the_broker_answered(sockets):
+    b = Broker("ws://h/ws", vhost="jobs", token="t", heartbeat_ms=20)
+    b.connect()
+    assert (b.send_every, b.expect_every) == (10.0, 10.0), "the fixture broker answers 10000,10000"
+    b.close()
+
+
+def test_a_silent_broker_is_a_dropped_connection(monkeypatch):
+    created = echoing_sockets(monkeypatch, "200,200")
+    b = Broker("ws://h/ws", vhost="jobs", token="t", heartbeat_ms=200, connect_timeout=2.0)
+    b.connect()
+    assert (b.send_every, b.expect_every) == (0.2, 0.2)
+    started = time.monotonic()
+    with pytest.raises(ConnectionLost, match="no heart-beat from the broker"):
+        for _ in b.consume("q", inactivity_timeout=0.05):
+            pass
+    assert 0.4 < time.monotonic() - started < 3.0, "after twice the interval plus a second's grace"
+    assert created[-1].close_calls >= 1
+    assert not b.connected
+    b.connect()
+    assert b.connected, "a fresh connect starts afresh"
+    b.close()
+
+
+def test_a_broker_that_declines_heart_beats_is_left_alone(monkeypatch):
+    created = echoing_sockets(monkeypatch, "0,0")
+    b = Broker("ws://h/ws", vhost="jobs", token="t", heartbeat_ms=20, connect_timeout=2.0)
+    b.connect()
+    assert (b.send_every, b.expect_every) == (0.0, 0.0)
+    gen = b.consume("q", inactivity_timeout=0.05)
+    for _ in range(5):
+        assert next(gen) is None
+    assert b.connected
+    assert b"\n" not in created[-1].sent, "nothing sent"
+    b.close()
+
+
+def test_heartbeat_thread_sends_a_newline(monkeypatch):
+    sockets = echoing_sockets(monkeypatch, "20,20")
     b = Broker("ws://h/ws", vhost="jobs", token="t", heartbeat_ms=20)
     b.connect()
     ws = sockets[-1]

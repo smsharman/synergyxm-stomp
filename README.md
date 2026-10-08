@@ -10,6 +10,13 @@ depends on this repo instead of carrying its own broker code.
   `reconnect!`, `run-with-refresh!`, `ws-url`). JDK `java.net.http.WebSocket`;
   no extra dependency.
 
+Both negotiate heart-beats (10 s each way by default, settled against the
+broker's answer), send them, and give up a connection that has sent nothing
+for twice the expected interval — the server's `doc/WORKER.md` makes this a
+requirement, because the Cloudflare tunnel drops idle WebSockets without
+closing them. Clojure reports the dead socket through `:on-closed`; Python's
+`consume` raises `ConnectionLost`.
+
 Why STOMP over WebSocket, and the exact AMQP → STOMP mapping, are in
 `UPDATE_WORKERS.md` in the [moshy-cam](https://github.com/smsharman/moshy-cam)
 repo and in `doc/WORKER.md` on the server.

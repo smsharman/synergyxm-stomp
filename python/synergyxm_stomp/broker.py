@@ -106,6 +106,10 @@ class Broker:
         self.vhost = vhost
         self.token = token
         self.heartbeat_ms = heartbeat_ms
+        # what the two sides settle on at CONNECTED (seconds; 0 = none)
+        self.send_every = 0.0
+        self.expect_every = 0.0
+        self._last_rx = time.monotonic()
         self.connect_timeout = connect_timeout
         self.connection_name = connection_name
         self._ws: websocket.WebSocket | None = None
@@ -142,6 +146,8 @@ class Broker:
             "heart-beat": f"{self.heartbeat_ms},{self.heartbeat_ms}",
         }
         self._raw_send(encode("CONNECT", headers))
+        self.send_every = self.expect_every = 0.0
+        self._last_rx = time.monotonic()
         deadline = time.monotonic() + self.connect_timeout
         while True:
             remaining = deadline - time.monotonic()
@@ -152,11 +158,18 @@ class Broker:
             if frame is None:
                 continue
             if frame.command == "CONNECTED":
+                self.send_every, self.expect_every = negotiate_heartbeat(
+                    f"{self.heartbeat_ms},{self.heartbeat_ms}", frame.headers.get("heart-beat")
+                )
+                self._last_rx = time.monotonic()
                 break
             if frame.command == "ERROR":
                 self.close()
                 raise StompError(_error_text(frame))
-        logger.info("STOMP connected to %s (vhost %s)", self.url, self.vhost)
+        logger.info(
+            "STOMP connected to %s (vhost %s), heart-beat send %.0fs / expect %.0fs",
+            self.url, self.vhost, self.send_every, self.expect_every,
+        )
         self._start_heartbeat()
         if self._sub is not None:
             self._subscribe(self._sub[1])
@@ -295,11 +308,13 @@ class Broker:
             try:
                 opcode, data = ws.recv_data()
             except websocket.WebSocketTimeoutException:
+                self._check_silence()
                 continue
             except (websocket.WebSocketConnectionClosedException, ConnectionError, socket.error) as e:
                 if self._closed:
                     return None
                 raise ConnectionLost(str(e)) from e
+            self._last_rx = time.monotonic()
             if opcode == websocket.ABNF.OPCODE_CLOSE:
                 if self._closed:
                     return None
@@ -312,9 +327,29 @@ class Broker:
             self._pending.extend(frames[1:])
             return frames[0]
 
+    def _check_silence(self) -> None:
+        """Raise ConnectionLost when the broker has sent nothing for twice the
+        negotiated interval (plus a second's grace): a connection a proxy
+        has dropped without closing it."""
+        if self.expect_every <= 0 or self._closed:
+            return
+        quiet = time.monotonic() - self._last_rx
+        if quiet > 2 * self.expect_every + 1.0:
+            logger.warning("STOMP connection dead: no heart-beat from the broker for %.0fs", quiet)
+            ws, self._ws = self._ws, None
+            self._hb_stop.set()
+            if ws is not None:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            raise ConnectionLost(f"no heart-beat from the broker for {quiet:.0f}s")
+
     def _start_heartbeat(self) -> None:
         self._hb_stop = threading.Event()
-        interval = self.heartbeat_ms / 1000.0
+        if self.send_every <= 0:
+            return
+        interval = self.send_every
 
         def run() -> None:
             while not self._hb_stop.wait(interval):
@@ -328,6 +363,17 @@ class Broker:
 
         self._hb_thread = threading.Thread(target=run, name="stomp-heartbeat", daemon=True)
         self._hb_thread.start()
+
+
+def negotiate_heartbeat(asked: str, answered: str | None) -> tuple[float, float]:
+    """The heart-beat the two sides settle on (STOMP 1.2): from what we asked,
+    ``cx,cy``, and what CONNECTED answered, ``sx,sy`` (absent: none). Returns
+    ``(send_every, expect_every)`` in seconds, 0 meaning none that way."""
+    cx, cy = (int(v.strip()) for v in asked.split(","))
+    sx, sy = (int(v.strip()) for v in answered.split(",")) if answered and answered.strip() else (0, 0)
+    send = max(cx, sy) / 1000.0 if cx > 0 and sy > 0 else 0.0
+    expect = max(cy, sx) / 1000.0 if cy > 0 and sx > 0 else 0.0
+    return send, expect
 
 
 def _error_text(frame: Frame) -> str:
