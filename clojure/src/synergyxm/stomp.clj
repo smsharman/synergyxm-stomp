@@ -13,6 +13,14 @@
                 (catch Exception e (nack!)))))
        (stomp/publish! conn \"job-events\" rk body {:user-id node-uuid}))
 
+   Message handlers run on the connection's own work thread, one at a
+   time, never on the WebSocket's receive thread: a handler that takes an
+   hour (a transcode) must not stop the receive thread reading the
+   broker's heart-beats, or the connection would be declared dead under
+   it and the job redelivered. `ack!`/`nack!` belong to the socket the
+   message came on; after a reconnect they are dropped with a warning,
+   since the broker requeued the message when that socket went.
+
    Heart-beats (doc/WORKER.md, *Heart-beats*): CONNECT asks for
    `:heartbeat-ms` both ways (10 s) and CONNECTED answers with the broker's;
    the connection then sends a newline every max(ours, broker's) ms and
@@ -40,7 +48,8 @@
            [java.nio.charset StandardCharsets]
            [java.time Duration]
            [java.util.concurrent CompletableFuture CompletionStage TimeUnit
-            Executors ScheduledExecutorService LinkedBlockingQueue TimeoutException]))
+            Executors ExecutorService ScheduledExecutorService LinkedBlockingQueue
+            TimeoutException ThreadFactory]))
 
 (def default-ws-port 15674)
 (def default-ws-path "/ws")
@@ -197,20 +206,35 @@
           (dead! conn (str "no heart-beat from the broker for " (- now @(:last-rx conn)) " ms")))))
     (catch Throwable t (log/debug t "heart-beat tick failed"))))
 
+(defn- acknowledge!
+  "Sends an ACK or NACK frame for `ack-id`, but only on the socket the
+   message arrived on: once that socket has been replaced the broker has
+   already requeued the message, and the frame would be an error on the
+   new one."
+  [conn ^WebSocket ws command headers]
+  (if (identical? ws (:ws @(:state conn)))
+    (send-text! conn (encode-frame command headers))
+    (log/warn command (get headers "id") "dropped: its socket has since been replaced"
+              "and the broker has requeued the message")))
+
 (defn- dispatch! [conn frame]
   (let [{:keys [command headers body]} frame
-        {:keys [subs on-error]} @(:state conn)]
+        {:keys [subs on-error ^ExecutorService work ^WebSocket ws]} @(:state conn)]
     (case command
       "MESSAGE"
       (let [sub-id (get headers "subscription")
             ack-id (or (get headers "ack") (get headers "message-id"))
             handler (get-in subs [sub-id :handler])]
         (if handler
-          (try
-            (handler {:body body :headers headers
-                      :ack!  (fn [] (send-text! conn (encode-frame "ACK" {"id" ack-id})))
-                      :nack! (fn [] (send-text! conn (encode-frame "NACK" {"id" ack-id "requeue" "false"})))})
-            (catch Throwable t (log/error t "STOMP message handler threw")))
+          ;; off the receive thread, so a long handler leaves it free to
+          ;; read the broker's heart-beats
+          (.execute work
+                    (fn []
+                      (try
+                        (handler {:body body :headers headers
+                                  :ack!  (fn [] (acknowledge! conn ws "ACK" {"id" ack-id}))
+                                  :nack! (fn [] (acknowledge! conn ws "NACK" {"id" ack-id "requeue" "false"}))})
+                        (catch Throwable t (log/error t "STOMP message handler threw")))))
           (log/warn "MESSAGE for unknown subscription" sub-id)))
       "ERROR"
       (let [msg (str "STOMP error: " (get headers "message") " " body)]
@@ -325,7 +349,12 @@
                             :connect-timeout (or connect-timeout 20)
                             :on-closed on-closed :on-error on-error
                             :subs {} :sub-seq 0 :connected? false :closing? false
-                            :exec (Executors/newSingleThreadScheduledExecutor)})
+                            :exec (Executors/newSingleThreadScheduledExecutor)
+                            ;; message handlers, one at a time (prefetch 1)
+                            :work (Executors/newSingleThreadExecutor
+                                    (reify ThreadFactory
+                                      (newThread [_ r]
+                                        (doto (Thread. ^Runnable r "stomp-work") (.setDaemon true)))))})
               :last-rx (atom 0) :last-tx (atom 0)
               :lock (Object.)}]
     (open-socket! conn)))
@@ -379,10 +408,12 @@
   conn)
 
 (defn shutdown!
-  "close! plus stop the internal executor. The connection is dead afterwards."
+  "close! plus stop the internal executors; a handler still running is
+   interrupted. The connection is dead afterwards."
   [conn]
   (close! conn)
   (.shutdownNow ^ScheduledExecutorService (:exec @(:state conn)))
+  (.shutdownNow ^ExecutorService (:work @(:state conn)))
   nil)
 
 ;; =============================================================================

@@ -435,6 +435,56 @@
           (is (stomp/connected? conn)))
         (finally (stomp/shutdown! conn))))))
 
+(deftest a-long-handler-does-not-starve-the-heart-beat
+  ;; The handler holds its thread for longer than the heart-beat tolerance
+  ;; while the server keeps sending heart-beats. They must still be read -
+  ;; the handler runs off the receive thread - so the connection is not
+  ;; declared dead and the job is not redelivered under it.
+  (with-server [srv]
+    (let [reasons  (atom [])
+          conn     (connect! srv {:heartbeat-ms 300 :on-closed #(swap! reasons conj %)})
+          started  (promise)
+          threads  (atom [])]
+      (try
+        (let [sub-id (stomp/subscribe! conn "q" (fn [m]
+                                                  (swap! threads conj (.getName (Thread/currentThread)))
+                                                  (deliver started true)
+                                                  (Thread/sleep 2500)
+                                                  ((:ack! m))))]
+          (wait-for #(seq (frames-of srv "SUBSCRIBE")))
+          (push-message! srv {"subscription" sub-id "ack" "ack-1"} "{}")
+          (is (deref started 2000 false))
+          ;; the broker's heart-beats, every 100 ms for the handler's 2.5 s
+          (dotimes [_ 28]
+            ;; a client that gave the socket up makes this throw: the fault
+            (try (.send ^WebSocket (last @(:sockets srv)) "\n") (catch Exception _ nil))
+            (Thread/sleep 100))
+          (is (empty? @reasons) "never declared dead")
+          (is (stomp/connected? conn))
+          (is (wait-for #(seq (frames-of srv "ACK")) 2000) "the handler finished and acked")
+          (is (= ["stomp-work"] @threads) "the handler ran on the connection's work thread"))
+        (finally (stomp/shutdown! conn))))))
+
+(deftest an-ack-after-a-reconnect-is-dropped
+  ;; A handler still running when the socket is replaced must not ACK on
+  ;; the new socket: the broker requeued the message with the old one.
+  (with-server [srv]
+    (let [conn    (connect! srv {})
+          release (promise)
+          acked   (promise)]
+      (try
+        (let [sub-id (stomp/subscribe! conn "q" (fn [m] (deref release 5000 nil) ((:ack! m)) (deliver acked true)))]
+          (wait-for #(seq (frames-of srv "SUBSCRIBE")))
+          (push-message! srv {"subscription" sub-id "ack" "ack-old"} "{}")
+          (Thread/sleep 100)
+          (stomp/reconnect! conn "tok-2")
+          (is (= 2 (count (frames-of srv "CONNECT"))))
+          (deliver release true)
+          (is (deref acked 2000 false) "the handler completed without throwing")
+          (Thread/sleep 200)
+          (is (empty? (frames-of srv "ACK")) "no ACK reached either socket"))
+        (finally (stomp/shutdown! conn))))))
+
 (deftest a-broker-that-declines-heart-beats-is-left-alone
   (with-server [srv]
     (let [reasons (atom [])
